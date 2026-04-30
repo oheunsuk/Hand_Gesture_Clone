@@ -10,16 +10,15 @@ import requests
 from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
-from tensorflow.keras.models import load_model
 
 STATUS_ENDPOINT = "http://localhost:8000/status"
 SEND_INTERVAL_SEC = 0.2
 SWIPE_COOLDOWN_SEC = 1.0
-GESTURE_CLASSES = ["palm", "fist", "thumb"]
 SEQUENCE_LENGTH = 20
 SMOOTHING_LENGTH = 5
-MOTION_WINDOW = 20
-MOTION_THRESHOLD = 0.15
+MOTION_WINDOW = 12
+MOTION_THRESHOLD = 0.08
+STOP_MOTION_SUPPRESS_THRESHOLD = 0.04
 
 
 def ensure_hand_landmarker_model() -> Path:
@@ -40,9 +39,19 @@ def ensure_hand_landmarker_model() -> Path:
     return model_path
 
 
-def decode_prediction(prediction: np.ndarray) -> str:
-    class_index = int(np.argmax(prediction, axis=1)[0])
-    return GESTURE_CLASSES[class_index]
+def detect_temporal_gesture(sequence_buffer: deque[np.ndarray]) -> str:
+    if len(sequence_buffer) < 8:
+        return "unknown"
+    sequence = np.array(sequence_buffer, dtype=np.float32)
+    tip_indices = [8, 12, 16, 20]
+    pip_indices = [6, 10, 14, 18]
+    extended = sequence[:, tip_indices, 1] < sequence[:, pip_indices, 1]
+    extended_ratio = float(np.mean(extended))
+    if extended_ratio >= 0.75:
+        return "palm"
+    if extended_ratio <= 0.30:
+        return "fist"
+    return "unknown"
 
 
 def draw_hand_landmarks(frame, hand_landmarks):
@@ -65,7 +74,7 @@ def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
     if not prediction_history:
         return "unknown", 0
     history_list = list(prediction_history)
-    labels = GESTURE_CLASSES + ["unknown"]
+    labels = ["palm", "fist", "unknown"]
     count_map = {label: history_list.count(label) for label in labels}
     smoothed_gesture = max(count_map, key=count_map.get)
     return smoothed_gesture, count_map[smoothed_gesture]
@@ -87,10 +96,16 @@ def detect_swipe_command(wrist_x_history: deque[float], now: float, last_swipe_t
     return "NONE", last_swipe_time
 
 
-def gesture_to_command(stable_gesture: str, swipe_command: str = "NONE") -> str:
+def get_motion_span(wrist_x_history: deque[float]) -> float:
+    if len(wrist_x_history) < 2:
+        return 0.0
+    return max(wrist_x_history) - min(wrist_x_history)
+
+
+def gesture_to_command(stable_gesture: str, swipe_command: str = "NONE", allow_palm_stop: bool = True) -> str:
     if swipe_command in ("LEFT", "RIGHT"):
         return swipe_command
-    if stable_gesture == "palm":
+    if stable_gesture == "palm" and allow_palm_stop:
         return "STOP"
     if stable_gesture == "fist":
         return "RESUME"
@@ -159,7 +174,6 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    model = load_model("gesture_lstm.h5")
     model_path = ensure_hand_landmarker_model()
     options = vision.HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(model_path)),
@@ -214,13 +228,7 @@ def main():
                     draw_hand_landmarks(display_frame, hand_landmarks)
                 landmark_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks], dtype=np.float32)
                 sequence_buffer.append(landmark_array)
-                if len(sequence_buffer) == SEQUENCE_LENGTH:
-                    input_tensor = np.array(sequence_buffer, dtype=np.float32)
-                    input_tensor = input_tensor.reshape(1, SEQUENCE_LENGTH, 63)
-                    prediction = model.predict(input_tensor, verbose=0)
-                    raw_gesture = decode_prediction(prediction)
-                else:
-                    raw_gesture = "unknown"
+                raw_gesture = detect_temporal_gesture(sequence_buffer)
 
             else:
                 sequence_buffer.clear()
@@ -234,10 +242,12 @@ def main():
             hold_seconds = 0.0
             now = time.monotonic()
             swipe_command = "NONE"
+            motion_span = 0.0
 
             # 손을 편 상태에서만 손목 x 이동 시계열로 좌/우 회전을 인식한다.
             if result.hand_landmarks and stable_gesture == "palm":
                 wrist_x_history.append(result.hand_landmarks[0][0].x)
+                motion_span = get_motion_span(wrist_x_history)
             else:
                 wrist_x_history.clear()
 
@@ -256,7 +266,8 @@ def main():
             else:
                 gesture = "unknown"
 
-            command = gesture_to_command(stable_gesture, swipe_command)
+            allow_palm_stop = not (stable_gesture == "palm" and motion_span >= STOP_MOTION_SUPPRESS_THRESHOLD)
+            command = gesture_to_command(stable_gesture, swipe_command, allow_palm_stop)
             if command == "STOP":
                 mode = "OVERRIDE"
                 robot_status = "Stopped"
