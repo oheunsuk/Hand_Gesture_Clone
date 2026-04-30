@@ -18,6 +18,8 @@ SWIPE_COOLDOWN_SEC = 1.0
 GESTURE_CLASSES = ["palm", "fist", "thumb"]
 SEQUENCE_LENGTH = 20
 SMOOTHING_LENGTH = 5
+MOTION_WINDOW = 20
+MOTION_THRESHOLD = 0.15
 
 
 def ensure_hand_landmarker_model() -> Path:
@@ -69,38 +71,29 @@ def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
     return smoothed_gesture, count_map[smoothed_gesture]
 
 
-def detect_swipe_gesture(wrist_x_history: deque) -> str:
-    """
-    손목 x 좌표의 시계열 변화량으로 swipe를 판단한다.
-    - 최근 20프레임 기준 delta_x = 마지막 x - 처음 x
-    - delta_x < -0.15: swipe_left
-    - delta_x >  0.15: swipe_right
-    - 그 외: unknown
-    """
-    if len(wrist_x_history) < 20:
-        return "unknown"
+def detect_swipe_command(wrist_x_history: deque[float], now: float, last_swipe_time: float) -> tuple[str, float]:
+    if len(wrist_x_history) < MOTION_WINDOW:
+        return "NONE", last_swipe_time
+    if (now - last_swipe_time) < SWIPE_COOLDOWN_SEC:
+        return "NONE", last_swipe_time
 
     delta_x = wrist_x_history[-1] - wrist_x_history[0]
-    if delta_x < -0.15:
-        return "swipe_left"
-    if delta_x > 0.15:
-        return "swipe_right"
-    return "unknown"
+    if delta_x >= MOTION_THRESHOLD:
+        wrist_x_history.clear()
+        return "RIGHT", now
+    if delta_x <= -MOTION_THRESHOLD:
+        wrist_x_history.clear()
+        return "LEFT", now
+    return "NONE", last_swipe_time
 
 
-def gesture_to_command(stable_gesture: str, swipe_gesture: str) -> str:
-    """
-    제스처를 제어 명령으로 변환한다.
-    우선순위: palm/fist(안정화) > swipe
-    """
+def gesture_to_command(stable_gesture: str, swipe_command: str = "NONE") -> str:
+    if swipe_command in ("LEFT", "RIGHT"):
+        return swipe_command
     if stable_gesture == "palm":
         return "STOP"
     if stable_gesture == "fist":
         return "RESUME"
-    if swipe_gesture == "swipe_left":
-        return "LEFT"
-    if swipe_gesture == "swipe_right":
-        return "RIGHT"
     return "NONE"
 
 
@@ -126,7 +119,7 @@ def draw_debug_ui(
     smoothing_count: int,
     prediction_history: list[str],
     hold_seconds: float,
-    swipe_gesture: str,
+    swipe_command: str,
     wrist_delta_x: float,
 ):
     """디버그 ON일 때만 보이는 작은 상태 텍스트."""
@@ -134,7 +127,7 @@ def draw_debug_ui(
     debug_lines = [
         f"Gesture: {gesture}",
         f"Stable Gesture: {stable_gesture}",
-        f"Swipe: {swipe_gesture}",
+        f"Swipe: {swipe_command}",
         f"Wrist delta_x(20): {wrist_delta_x:.3f}",
         f"Frame Count: {smoothing_count}/5",
         f"History Size: {len(prediction_history)}",
@@ -179,14 +172,13 @@ def main():
 
     gesture = "unknown"  # 현재 프레임 원시 제스처
     stable_gesture = "unknown"
-    swipe_gesture = "unknown"
     wrist_delta_x = 0.0
     smoothing_count = 0
 
     sequence_buffer = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history = deque(maxlen=SMOOTHING_LENGTH)
     # 최근 20프레임 손목 x 좌표 버퍼 (swipe 판단용)
-    wrist_x_history = deque(maxlen=20)
+    wrist_x_history = deque(maxlen=MOTION_WINDOW)
 
     # 테스트용 모드/명령 상태
     mode = "AUTO"
@@ -230,49 +222,41 @@ def main():
                 else:
                     raw_gesture = "unknown"
 
-                # 손목(landmark 0) x 좌표를 최근 20프레임 버퍼에 누적한다.
-                wrist_x_history.append(hand_landmarks[0].x)
             else:
                 sequence_buffer.clear()
                 raw_gesture = "unknown"
                 wrist_x_history.clear()
-                swipe_gesture = "unknown"
+                swipe_command = "NONE"
                 wrist_delta_x = 0.0
 
             prediction_history.append(raw_gesture)
             stable_gesture, smoothing_count = get_smoothed_gesture(prediction_history)
             hold_seconds = 0.0
             now = time.monotonic()
+            swipe_command = "NONE"
 
-            # 손목 x 이동량 기반 swipe 판단 + 1초 쿨다운
-            swipe_now = detect_swipe_gesture(wrist_x_history)
-            if len(wrist_x_history) == 20:
+            # 손을 편 상태에서만 손목 x 이동 시계열로 좌/우 회전을 인식한다.
+            if result.hand_landmarks and stable_gesture == "palm":
+                wrist_x_history.append(result.hand_landmarks[0][0].x)
+            else:
+                wrist_x_history.clear()
+
+            if len(wrist_x_history) == MOTION_WINDOW:
                 wrist_delta_x = wrist_x_history[-1] - wrist_x_history[0]
             else:
                 wrist_delta_x = 0.0
 
-            now = time.monotonic()
-            if swipe_now in ("swipe_left", "swipe_right") and (now - last_swipe_time) >= SWIPE_COOLDOWN_SEC:
-                swipe_gesture = swipe_now
-                last_swipe_time = now
-                wrist_x_history.clear()
-            else:
-                swipe_gesture = "unknown"
+            swipe_command, last_swipe_time = detect_swipe_command(wrist_x_history, now, last_swipe_time)
 
-            # gesture 표시는 palm/fist 우선, 없으면 swipe 반영
+            # gesture 표시는 분류 결과를 우선 사용하고, swipe가 발생하면 명령 라벨을 표시한다.
             if raw_gesture in ("palm", "fist"):
                 gesture = raw_gesture
-            elif swipe_gesture != "unknown":
-                gesture = swipe_gesture
+            elif swipe_command in ("LEFT", "RIGHT"):
+                gesture = swipe_command.lower()
             else:
                 gesture = "unknown"
 
-            # stable_gesture도 palm/fist 우선, 없으면 swipe 반영 (웹 UI 반영용)
-            if stable_gesture == "unknown" and swipe_gesture != "unknown":
-                stable_gesture = swipe_gesture
-
-            # 명령 우선순위: palm/fist(안정화) > swipe
-            command = gesture_to_command(stable_gesture, swipe_gesture)
+            command = gesture_to_command(stable_gesture, swipe_command)
             if command == "STOP":
                 mode = "OVERRIDE"
                 robot_status = "Stopped"
@@ -297,7 +281,7 @@ def main():
                     smoothing_count,
                     list(prediction_history),
                     hold_seconds,
-                    swipe_gesture,
+                    swipe_command,
                     wrist_delta_x,
                 )
 

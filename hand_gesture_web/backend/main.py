@@ -76,6 +76,9 @@ show_overlay = True
 GESTURE_CLASSES = ["palm", "fist", "thumb"]
 SEQUENCE_LENGTH = 20
 SMOOTHING_LENGTH = 5
+MOTION_WINDOW = 20
+MOTION_THRESHOLD = 0.15
+SWIPE_COOLDOWN_SEC = 0.7
 gesture_model = load_model("gesture_lstm.h5")
 
 
@@ -90,16 +93,6 @@ def ensure_hand_landmarker_model() -> Path:
         )
         urllib.request.urlretrieve(model_url, str(model_path))
     return model_path
-
-
-def detect_raw_gesture(hand_landmarks) -> str:
-    tip_pip_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
-    extended_count = sum(1 for tip, pip in tip_pip_pairs if hand_landmarks[tip].y < hand_landmarks[pip].y)
-    if extended_count >= 4:
-        return "palm"
-    if extended_count <= 1:
-        return "fist"
-    return "unknown"
 
 
 def decode_prediction(prediction: np.ndarray) -> str:
@@ -117,12 +110,31 @@ def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
     return smoothed_gesture, count_map[smoothed_gesture]
 
 
-def gesture_to_command(stable_gesture: str) -> CommandType:
+def gesture_to_command(stable_gesture: str, swipe_command: CommandType = "NONE") -> CommandType:
+    if swipe_command in {"LEFT", "RIGHT"}:
+        return swipe_command
     if stable_gesture == "palm":
         return "STOP"
     if stable_gesture == "fist":
         return "RESUME"
     return "NONE"
+
+
+def detect_swipe_command(wrist_x_buffer: deque[float], now: float, last_swipe_time: float) -> tuple[CommandType, float]:
+    if len(wrist_x_buffer) < MOTION_WINDOW:
+        return "NONE", last_swipe_time
+
+    if (now - last_swipe_time) < SWIPE_COOLDOWN_SEC:
+        return "NONE", last_swipe_time
+
+    delta_x = wrist_x_buffer[-1] - wrist_x_buffer[0]
+    if delta_x >= MOTION_THRESHOLD:
+        wrist_x_buffer.clear()
+        return "RIGHT", now
+    if delta_x <= -MOTION_THRESHOLD:
+        wrist_x_buffer.clear()
+        return "LEFT", now
+    return "NONE", last_swipe_time
 
 
 def draw_hand_landmarks(frame, hand_landmarks) -> None:
@@ -183,6 +195,8 @@ def camera_worker_loop() -> None:
     )
     sequence_buffer: deque[np.ndarray] = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history: deque[str] = deque(maxlen=SMOOTHING_LENGTH)
+    wrist_x_buffer: deque[float] = deque(maxlen=MOTION_WINDOW)
+    last_swipe_time = 0.0
 
     with vision.HandLandmarker.create_from_options(options) as detector:
         while camera_worker_running:
@@ -230,13 +244,22 @@ def camera_worker_loop() -> None:
                     draw_hand_landmarks(frame, hand_landmarks)
             else:
                 sequence_buffer.clear()
+                wrist_x_buffer.clear()
                 gesture = "unknown"
 
             prediction_history.append(gesture)
             stable_gesture, _ = get_smoothed_gesture(prediction_history)
             now = time.monotonic()
+            swipe_command: CommandType = "NONE"
 
-            auto_command = gesture_to_command(stable_gesture)
+            # 손을 편 상태(palm)에서만 좌우 흔들기 시계열 인식을 활성화한다.
+            if result.hand_landmarks and stable_gesture == "palm":
+                wrist_x_buffer.append(result.hand_landmarks[0][0].x)
+                swipe_command, last_swipe_time = detect_swipe_command(wrist_x_buffer, now, last_swipe_time)
+            else:
+                wrist_x_buffer.clear()
+
+            auto_command = gesture_to_command(stable_gesture, swipe_command)
             auto_robot_status = "Stopped" if auto_command == "STOP" else "Moving"
 
             with state_lock:
