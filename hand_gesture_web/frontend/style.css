@@ -97,7 +97,7 @@ h1 {
 
 .value {
   margin: 0;
-  font-size: clamp(24px, 3.2vw, 40px);
+  font-size: clamp(18px, 2.2vw, 28px);
   font-weight: 800;
   letter-spacing: 0.02em;
 }
