@@ -7,9 +7,11 @@ if __name__ == '__main__':
     data_yaml = yolo_dir / "data.yaml"
     runs_dir = yolo_dir / "runs"
 
-    # GPU 사용 가능 여부 확인 (MX450 체크)
-    device = 0 if torch.cuda.is_available() else 'cpu'
-    print(f"사용 장치: {device}")
+    # GPU 강제 사용: CUDA가 없으면 즉시 종료
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA를 찾지 못했습니다. GPU 드라이버/환경을 확인하세요.")
+    device = 0
+    print(f"사용 장치: cuda:{device}")
 
     # 1. 모델 로드 (가장 가벼운 Nano 모델)
     model = YOLO('yolov8n.pt') 

@@ -5,9 +5,21 @@ from pathlib import Path
 
 # 1. 모델 로드
 yolo_dir = Path(__file__).resolve().parent
-best_pt = yolo_dir / "runs" / "serbot_test" / "weights" / "best.pt"
-if not best_pt.exists():
-    raise FileNotFoundError(f"best.pt 파일을 찾을 수 없습니다: {best_pt}")
+run_dir = yolo_dir / "runs"
+best_candidates = list(run_dir.glob("serbot_test*/weights/best.pt"))
+
+if not best_candidates:
+    # 이전 고정 경로도 호환
+    legacy_best = run_dir / "serbot_test" / "weights" / "best.pt"
+    if legacy_best.exists():
+        best_pt = legacy_best
+    else:
+        raise FileNotFoundError(f"best.pt 파일을 찾을 수 없습니다: {legacy_best}")
+else:
+    # 가장 최근 학습 결과(best.pt 수정시각 기준) 사용
+    best_pt = max(best_candidates, key=lambda p: p.stat().st_mtime)
+
+print(f"사용 모델: {best_pt}")
 model = YOLO(str(best_pt))
 
 cap = cv2.VideoCapture(0)

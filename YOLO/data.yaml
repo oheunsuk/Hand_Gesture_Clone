@@ -1,6 +1,6 @@
 # YOLO/data.yaml
-# 프로젝트 기준 절대경로 사용
-path: C:/Hand/Hand_Gesture/YOLO/datasets
+# 현재 프로젝트의 실제 데이터셋 경로
+path: D:/학술제/Hand_Gesture/YOLO/datasets
 train: train/images
 val: val/images
 
