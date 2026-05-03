@@ -11,7 +11,6 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
 from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
@@ -24,7 +23,7 @@ from pydantic import BaseModel
 
 ModeType = Literal["AUTO", "OVERRIDE"]
 CommandType = Literal["NONE", "STOP", "RESUME", "LEFT", "RIGHT"]
-SourceType = Literal["gesture", "web"]
+SourceType = Literal["gesture", "web", "gesture_client"]
 
 
 class StatusState(BaseModel):
@@ -34,6 +33,8 @@ class StatusState(BaseModel):
     command: CommandType = "NONE"
     robot_status: str = "Moving"
     source: SourceType = "gesture"
+    swipe_series: str = ""
+    swipe_delta_series: str = ""
 
 
 class StatusUpdateRequest(BaseModel):
@@ -43,6 +44,8 @@ class StatusUpdateRequest(BaseModel):
     command: CommandType
     robot_status: str
     source: SourceType = "gesture"
+    swipe_series: str = ""
+    swipe_delta_series: str = ""
 
 
 class CommandRequest(BaseModel):
@@ -64,6 +67,7 @@ app.add_middleware(
 
 state_lock = Lock()
 current_status = StatusState()
+last_status_post: StatusState | None = None
 camera_lock = Lock()
 camera_capture = None
 frame_lock = Lock()
@@ -72,13 +76,14 @@ camera_worker_running = False
 camera_worker_thread: Thread | None = None
 landmark_enabled = False
 show_overlay = True
-SEQUENCE_LENGTH = 20
 SMOOTHING_LENGTH = 5
-ROTATION_WINDOW = 10
-ROTATION_COOLDOWN_SEC = 0.8
-THUMB_DELTA_THRESHOLD = 0.05
-FINGERS_DELTA_THRESHOLD = 0.03
-MAX_WRIST_X_DRIFT = 0.12
+WRIST_SMOOTHING_LENGTH = 5
+SWIPE_WRIST_BUFFER_SIZE = 12
+MOTION_THRESHOLD = 0.10
+LINEARITY_THRESHOLD = 0.55
+SWIPE_COOLDOWN_SEC = 0.35
+ROTATION_COMMAND_HOLD_SEC = 0.7
+SWIPE_SERIES_LENGTH = 30
 
 
 def ensure_hand_landmarker_model() -> Path:
@@ -94,21 +99,6 @@ def ensure_hand_landmarker_model() -> Path:
     return model_path
 
 
-def detect_temporal_gesture(sequence_buffer: deque[np.ndarray]) -> str:
-    if len(sequence_buffer) < 8:
-        return "unknown"
-    sequence = np.array(sequence_buffer, dtype=np.float32)
-    tip_indices = [8, 12, 16, 20]
-    pip_indices = [6, 10, 14, 18]
-    extended = sequence[:, tip_indices, 1] < sequence[:, pip_indices, 1]
-    extended_ratio = float(np.mean(extended))
-    if extended_ratio >= 0.75:
-        return "palm"
-    if extended_ratio <= 0.30:
-        return "fist"
-    return "unknown"
-
-
 def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
     if not prediction_history:
         return "unknown", 0
@@ -119,50 +109,66 @@ def get_smoothed_gesture(prediction_history: deque[str]) -> tuple[str, int]:
     return smoothed_gesture, count_map[smoothed_gesture]
 
 
-def gesture_to_command(stable_gesture: str, rotate_command: CommandType = "NONE", allow_palm_stop: bool = True) -> CommandType:
-    if rotate_command in {"LEFT", "RIGHT"}:
-        return rotate_command
+def classify_static_gesture(landmarks: np.ndarray) -> str:
+    """현재 프레임만 보고 palm/fist를 빠르게 분류한다."""
+    if landmarks.shape[0] < 21:
+        return "unknown"
+
+    tip_indices = [8, 12, 16, 20]
+    pip_indices = [6, 10, 14, 18]
+    extended_count = int(np.sum(landmarks[tip_indices, 1] < landmarks[pip_indices, 1] - 0.01))
+    curled_count = int(np.sum(landmarks[tip_indices, 1] > landmarks[pip_indices, 1] + 0.005))
+
+    if extended_count >= 3:
+        return "palm"
+    if curled_count >= 3:
+        return "fist"
+    return "unknown"
+
+
+def smooth_wrist_x(wrist_x_history: deque[float], wrist_x: float) -> float:
+    """손목 x 좌표 흔들림을 이동평균으로 줄인다."""
+    if not np.isfinite(wrist_x):
+        return 0.5
+    wrist_x_history.append(wrist_x)
+    return float(np.mean(wrist_x_history))
+
+
+def detect_swipe_command(
+    wrist_x_history: deque[float],
+    stable_gesture: str,
+    gesture: str,
+) -> tuple[str, float, float]:
+    if len(wrist_x_history) < 2:
+        return "NONE", 0.0, 0.0
+    xs = list(wrist_x_history)
+    first_x, last_x = xs[0], xs[-1]
+    delta_x = float(last_x - first_x)
+    motion_span = float(max(xs) - min(xs))
+    if motion_span < MOTION_THRESHOLD:
+        return "NONE", delta_x, motion_span
+    linearity = abs(delta_x) / motion_span if motion_span > 1e-9 else 0.0
+    if linearity < LINEARITY_THRESHOLD:
+        return "NONE", delta_x, motion_span
+    if stable_gesture != "palm" and gesture != "palm":
+        return "NONE", delta_x, motion_span
+    if delta_x > 0:
+        return "RIGHT", delta_x, motion_span
+    if delta_x < 0:
+        return "LEFT", delta_x, motion_span
+    return "NONE", delta_x, motion_span
+
+
+def gesture_to_command(
+    stable_gesture: str, swipe_command: CommandType = "NONE", allow_palm_stop: bool = True
+) -> CommandType:
+    if swipe_command in {"LEFT", "RIGHT"}:
+        return swipe_command
     if stable_gesture == "palm" and allow_palm_stop:
         return "STOP"
     if stable_gesture == "fist":
         return "RESUME"
     return "NONE"
-
-
-def is_tiger_pose(landmarks: np.ndarray) -> bool:
-    tip_pip_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
-    curled_count = sum(1 for tip, pip in tip_pip_pairs if landmarks[tip, 1] > landmarks[pip, 1] + 0.01)
-    return curled_count >= 3
-
-
-def detect_rotation_command(
-    sequence_buffer: deque[np.ndarray], now: float, last_rotation_time: float
-) -> tuple[CommandType, float, float, float]:
-    if len(sequence_buffer) < ROTATION_WINDOW:
-        return "NONE", last_rotation_time, 0.0, 0.0
-
-    if (now - last_rotation_time) < ROTATION_COOLDOWN_SEC:
-        return "NONE", last_rotation_time, 0.0, 0.0
-
-    window_frames = list(sequence_buffer)[-ROTATION_WINDOW:]
-    start = window_frames[0]
-    end = window_frames[-1]
-
-    if not (is_tiger_pose(start) and is_tiger_pose(end)):
-        return "NONE", last_rotation_time, 0.0, 0.0
-
-    wrist_x_drift = abs(end[0, 0] - start[0, 0])
-    if wrist_x_drift > MAX_WRIST_X_DRIFT:
-        return "NONE", last_rotation_time, 0.0, 0.0
-
-    thumb_delta = float(end[4, 1] - start[4, 1])
-    fingers_delta = float(np.mean(end[[8, 12, 16, 20], 1] - start[[8, 12, 16, 20], 1]))
-
-    if thumb_delta <= -THUMB_DELTA_THRESHOLD and fingers_delta >= FINGERS_DELTA_THRESHOLD:
-        return "LEFT", now, thumb_delta, fingers_delta
-    if thumb_delta >= THUMB_DELTA_THRESHOLD and fingers_delta <= -FINGERS_DELTA_THRESHOLD:
-        return "RIGHT", now, thumb_delta, fingers_delta
-    return "NONE", last_rotation_time, thumb_delta, fingers_delta
 
 
 def draw_hand_landmarks(frame, hand_landmarks) -> None:
@@ -221,9 +227,14 @@ def camera_worker_loop() -> None:
         min_tracking_confidence=0.7,
         min_hand_presence_confidence=0.7,
     )
-    sequence_buffer: deque[np.ndarray] = deque(maxlen=SEQUENCE_LENGTH)
     prediction_history: deque[str] = deque(maxlen=SMOOTHING_LENGTH)
-    last_rotation_time = 0.0
+    wrist_smooth_buf: deque[float] = deque(maxlen=WRIST_SMOOTHING_LENGTH)
+    wrist_x_history: deque[float] = deque(maxlen=SWIPE_WRIST_BUFFER_SIZE)
+    swipe_series_chars: deque[str] = deque(maxlen=SWIPE_SERIES_LENGTH)
+    delta_series_vals: deque[float] = deque(maxlen=SWIPE_SERIES_LENGTH)
+    last_swipe_confirm_time = 0.0
+    last_turn_command: CommandType = "NONE"
+    last_turn_time = 0.0
 
     with vision.HandLandmarker.create_from_options(options) as detector:
         while camera_worker_running:
@@ -256,55 +267,89 @@ def camera_worker_loop() -> None:
             if result.hand_landmarks:
                 hand_landmarks = result.hand_landmarks[0]
                 landmark_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks], dtype=np.float32)
-                sequence_buffer.append(landmark_array)
-                gesture = detect_temporal_gesture(sequence_buffer)
+                gesture = classify_static_gesture(landmark_array)
 
                 # 랜드마크 토글이 켜진 경우에만 오버레이를 그린다.
                 if landmark_enabled:
                     draw_hand_landmarks(frame, hand_landmarks)
             else:
-                sequence_buffer.clear()
+                wrist_smooth_buf.clear()
+                wrist_x_history.clear()
                 gesture = "unknown"
 
             prediction_history.append(gesture)
             stable_gesture, _ = get_smoothed_gesture(prediction_history)
             now = time.monotonic()
-            rotate_command: CommandType = "NONE"
-            thumb_delta = 0.0
-            fingers_delta = 0.0
+            swipe_rotate: CommandType = "NONE"
+            swipe_command: CommandType = "NONE"
+            rotation_delta = 0.0
 
-            # 호랑이 발 모양에서 손 회전(엄지/나머지 손가락 반대 방향 y 변화) 인식
             if result.hand_landmarks:
-                rotate_command, last_rotation_time, thumb_delta, fingers_delta = detect_rotation_command(
-                    sequence_buffer, now, last_rotation_time
-                )
+                raw_wrist_x = float(result.hand_landmarks[0][0].x)
+                smoothed_x = smooth_wrist_x(wrist_smooth_buf, raw_wrist_x)
+                wrist_x_history.append(smoothed_x)
+                raw_cmd, _, _ = detect_swipe_command(wrist_x_history, stable_gesture, gesture)
+                if raw_cmd in ("LEFT", "RIGHT") and (now - last_swipe_confirm_time) >= SWIPE_COOLDOWN_SEC:
+                    swipe_rotate = "LEFT" if raw_cmd == "LEFT" else "RIGHT"
+                    last_swipe_confirm_time = now
+                    wrist_x_history.clear()
+            else:
+                wrist_smooth_buf.clear()
+                last_turn_command = "NONE"
+                last_turn_time = 0.0
 
-            rotating_now = abs(thumb_delta) >= 0.02 or abs(fingers_delta) >= 0.02
-            allow_palm_stop = not (stable_gesture == "palm" and rotating_now)
-            auto_command = gesture_to_command(stable_gesture, rotate_command, allow_palm_stop)
-            auto_robot_status = "Stopped" if auto_command == "STOP" else "Moving"
+            if swipe_rotate in ("LEFT", "RIGHT"):
+                last_turn_command = swipe_rotate
+                last_turn_time = now
+            if (now - last_turn_time) < ROTATION_COMMAND_HOLD_SEC and last_turn_command in ("LEFT", "RIGHT"):
+                swipe_command = last_turn_command
+            else:
+                swipe_command = swipe_rotate if swipe_rotate in ("LEFT", "RIGHT") else "NONE"
+
+            if swipe_rotate == "LEFT":
+                swipe_series_chars.append("L")
+                rotation_delta = -1.0
+            elif swipe_rotate == "RIGHT":
+                swipe_series_chars.append("R")
+                rotation_delta = 1.0
+            else:
+                swipe_series_chars.append(".")
+            delta_series_vals.append(rotation_delta)
+            swipe_series_text = "".join(swipe_series_chars)
+            delta_series_text = " ".join(f"{v:+.0f}" for v in list(delta_series_vals)[-10:])
+
+            moving_now = swipe_command in {"LEFT", "RIGHT"}
+            rotation_hold_active = (
+                (now - last_turn_time) < ROTATION_COMMAND_HOLD_SEC and last_turn_command in ("LEFT", "RIGHT")
+            )
+            recently_swiped = (now - last_swipe_confirm_time) < SWIPE_COOLDOWN_SEC
+            stop_blocked = stable_gesture == "palm" and (moving_now or recently_swiped or rotation_hold_active)
+            allow_palm_stop = not stop_blocked
+            auto_command = gesture_to_command(stable_gesture, swipe_command, allow_palm_stop)
+            if rotation_hold_active:
+                auto_command = last_turn_command
+
+            if auto_command != "NONE":
+                auto_mode: ModeType = "OVERRIDE"
+                auto_robot_status = "Stopped" if auto_command == "STOP" else "Moving"
+            else:
+                auto_mode = "AUTO"
+                auto_command = "NONE"
+                auto_robot_status = "Moving"
 
             with state_lock:
-                status = current_status
-                mode_is_web_override = status.mode == "OVERRIDE" and status.source == "web"
-                if mode_is_web_override:
-                    current_status = status.model_copy(
-                        update={
-                            "gesture": gesture,
-                            "stable_gesture": stable_gesture,
-                        }
-                    )
-                else:
-                    current_status = status.model_copy(
-                        update={
-                            "mode": "AUTO",
-                            "gesture": gesture,
-                            "stable_gesture": stable_gesture,
-                            "command": auto_command,
-                            "robot_status": auto_robot_status,
-                            "source": "gesture",
-                        }
-                    )
+                current_status = current_status.model_copy(
+                    update={
+                        "mode": auto_mode,
+                        "gesture": gesture,
+                        "stable_gesture": stable_gesture,
+                        "command": auto_command,
+                        "robot_status": auto_robot_status,
+                        "source": "gesture",
+                        "swipe_series": swipe_series_text,
+                        "swipe_delta_series": delta_series_text,
+                    }
+                )
 
             with state_lock:
                 mode_text = current_status.mode
@@ -361,7 +406,23 @@ def mjpeg_frame_generator():
 @app.get("/status", response_model=StatusState)
 def get_status() -> StatusState:
     with state_lock:
-        return current_status.model_copy(deep=True)
+        out = current_status.model_copy(deep=True)
+        if last_status_post is not None:
+            out = out.model_copy(
+                update={
+                    "swipe_series": last_status_post.swipe_series or "",
+                    "swipe_delta_series": last_status_post.swipe_delta_series or "",
+                }
+            )
+        return out
+
+
+@app.get("/get_status", response_model=StatusState)
+def get_status_from_post() -> StatusState:
+    with state_lock:
+        if last_status_post is None:
+            return current_status.model_copy(deep=True)
+        return last_status_post.model_copy(deep=True)
 
 
 class LandmarkToggleRequest(BaseModel):
@@ -382,11 +443,11 @@ def set_landmark_state(payload: LandmarkToggleRequest) -> dict:
 
 @app.post("/status", response_model=StatusState)
 def update_status(payload: StatusUpdateRequest) -> StatusState:
-    # 외부 업데이트도 호환 유지하되, 통합 백엔드에서는 기본적으로 내부 인식 루프가 상태를 관리한다.
+    global current_status, last_status_post
     with state_lock:
         updated = StatusState(**payload.model_dump())
-        global current_status
         current_status = updated
+        last_status_post = updated.model_copy(deep=True)
         return current_status.model_copy(deep=True)
 
 
@@ -437,8 +498,14 @@ def serve_frontend_index() -> FileResponse:
     return FileResponse(FRONTEND_DIR / "index.html")
 
 
-# /style.css, /app.js 등 정적 파일 서빙
-app.mount("/", StaticFiles(directory=FRONTEND_DIR), name="frontend-static")
+@app.get("/style.css")
+def serve_style_css() -> FileResponse:
+    return FileResponse(FRONTEND_DIR / "style.css", media_type="text/css")
+
+
+@app.get("/app.js")
+def serve_app_js() -> FileResponse:
+    return FileResponse(FRONTEND_DIR / "app.js", media_type="application/javascript")
 
 
 @app.on_event("shutdown")

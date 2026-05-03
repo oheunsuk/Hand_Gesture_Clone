@@ -10,6 +10,9 @@ const el = {
   commandValue: document.getElementById("command-value"),
   robotStatusValue: document.getElementById("robot-status-value"),
   laptopCamera: document.getElementById("laptop-camera"),
+  robotCamera: document.getElementById("robot-camera"),
+  swipeSeriesValue: document.getElementById("swipe-series-value"),
+  swipeDeltaValue: document.getElementById("swipe-delta-value"),
   landmarkToggleBtn: document.getElementById("landmark-toggle-btn"),
   connectionStatus: document.getElementById("connection-status"),
   message: document.getElementById("message"),
@@ -55,6 +58,19 @@ function updateView(status) {
   el.stableGestureValue.textContent = stableGesture;
   el.commandValue.textContent = command;
   el.robotStatusValue.textContent = robotStatus;
+  const swipeSeries =
+    status.swipe_series ?? status.swipeSeries ?? status["swipe_series"] ?? "";
+  const swipeDelta =
+    status.swipe_delta_series ??
+    status.swipeDeltaSeries ??
+    status["swipe_delta_series"] ??
+    "";
+  if (el.swipeSeriesValue) {
+    el.swipeSeriesValue.textContent = swipeSeries ? String(swipeSeries) : "-";
+  }
+  if (el.swipeDeltaValue) {
+    el.swipeDeltaValue.textContent = swipeDelta ? String(swipeDelta) : "-";
+  }
 
   el.modeCard.classList.remove("mode-auto", "mode-override");
   if (mode === "OVERRIDE") {
@@ -69,9 +85,12 @@ function updateView(status) {
     if (source === "web") {
       el.sourceCard.classList.add("web");
       el.sourceValue.textContent = "Web";
+    } else if (source === "gesture_client") {
+      el.sourceCard.classList.add("gesture");
+      el.sourceValue.textContent = "Gesture app";
     } else {
       el.sourceCard.classList.add("gesture");
-      el.sourceValue.textContent = "Gesture";
+      el.sourceValue.textContent = "Camera";
     }
   }
 }
@@ -89,7 +108,10 @@ function updateLandmarkToggleButton() {
 }
 
 async function getStatus() {
-  const response = await fetch(`${API_BASE_URL}/status`, { method: "GET" });
+  const response = await fetch(`${API_BASE_URL}/status`, {
+    method: "GET",
+    cache: "no-store",
+  });
   if (!response.ok) {
     throw new Error(`Failed to fetch status: ${response.status}`);
   }
@@ -187,13 +209,13 @@ function bindLandmarkToggleButton() {
   });
 }
 
-async function startLaptopCamera() {
-  if (!el.laptopCamera) return;
-  const streamUrl = `${API_BASE_URL}/stream/laptop.mjpg`;
-  el.laptopCamera.src = streamUrl;
-  el.laptopCamera.onerror = () => {
-    setMessage("Laptop camera stream disconnected", true);
-  };
+function startLaptopCamera() {
+  if (el.laptopCamera) {
+    el.laptopCamera.src = `${API_BASE_URL}/stream/laptop.mjpg`;
+    el.laptopCamera.onerror = () => {
+      setMessage("노트북 카메라 스트림 연결 실패", true);
+    };
+  }
 }
 
 function start() {
