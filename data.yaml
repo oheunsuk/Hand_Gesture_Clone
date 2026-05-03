@@ -1,0 +1,10 @@
+# C:\LGH_kangnam_univ\2026-1\dont_touch\data.yaml
+
+# 데이터셋 루트 경로 (이미지들이 들어있는 상위 폴더)
+path: C:/LGH_kangnam_univ/2026-1/dont_touch/datasets 
+
+train: C:/LGH_kangnam_univ/2026-1/dont_touch/datasets/train/images
+val: C:/LGH_kangnam_univ/2026-1/dont_touch/datasets/val/images
+
+nc: 2
+names: ['muk', 'bba']
