@@ -2,8 +2,12 @@ import cv2
 import mediapipe as mp
 import sys
 import traceback
+import time
+import urllib.request
 from pathlib import Path
 from importlib.metadata import version as pkg_version
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python import vision
 
 HAND_GESTURE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HAND_GESTURE_ROOT))
@@ -110,21 +114,37 @@ print(
     f"{(hand_landmark_dir / 'hand_landmark_tracking_cpu.binarypb').exists()}"
 )
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-hands = None
+def ensure_hand_landmarker_model() -> Path:
+    model_dir = Path("C:/mp_models")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / "hand_landmarker.task"
+    if not model_path.exists():
+        model_url = (
+            "https://storage.googleapis.com/mediapipe-models/"
+            "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+        )
+        print("[INFO] HandLandmarker 모델 다운로드 중...")
+        urllib.request.urlretrieve(model_url, str(model_path))
+    return model_path
+
+
+hand_detector = None
 fallback_mode = False
 try:
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.8,
-        min_tracking_confidence=0.8
+    model_path = ensure_hand_landmarker_model()
+    hand_detector_options = vision.HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(model_path)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.8,
+        min_tracking_confidence=0.8,
+        min_hand_presence_confidence=0.8,
     )
-    print("[OK] MediaPipe Hands initialized")
+    hand_detector = vision.HandLandmarker.create_from_options(hand_detector_options)
+    print("[OK] MediaPipe HandLandmarker initialized")
 except Exception as e:
     fallback_mode = True
-    print(f"[ERROR] MediaPipe Hands 초기화 실패: {e}")
+    print(f"[ERROR] MediaPipe HandLandmarker 초기화 실패: {e}")
     print(f"[ERROR] 예외 타입: {type(e).__name__}")
     print(f"[ERROR] mediapipe root path: {mp_root}")
     print(f"[ERROR] hand_landmark dir path: {hand_landmark_dir}")
@@ -155,16 +175,18 @@ while cap.isOpened():
     frame = cv2.flip(frame, 1) # 거울 모드
     h, w, _ = frame.shape
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb_frame) if hands is not None else None
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    timestamp_ms = int(time.monotonic() * 1000)
+    results = hand_detector.detect_for_video(mp_image, timestamp_ms) if hand_detector is not None else None
     
     yolo_label = ""
     display_frame = frame.copy()
 
-    if results and results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
+    if results and results.hand_landmarks:
+        for hand_landmarks in results.hand_landmarks:
             # [데이터 1] YOLO용 자동 박스 계산
-            x_coords = [lm.x for lm in hand_landmarks.landmark]
-            y_coords = [lm.y for lm in hand_landmarks.landmark]
+            x_coords = [lm.x for lm in hand_landmarks]
+            y_coords = [lm.y for lm in hand_landmarks]
             x_min, x_max = min(x_coords), max(x_coords)
             y_min, y_max = min(y_coords), max(y_coords)
 
@@ -189,7 +211,7 @@ while cap.isOpened():
             yolo_label = f"{current_class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
             
             # [데이터 2] 팀원이 쓸 손목(Wrist) 좌표 시각화
-            wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
+            wrist = hand_landmarks[0]
             cv2.circle(display_frame, (int(wrist.x*w), int(wrist.y*h)), 10, (255, 0, 0), -1)
             
             # 시각화 가이드 (녹색 박스)
@@ -266,6 +288,6 @@ while cap.isOpened():
         break
 
 cap.release()
-if hands is not None:
-    hands.close()
+if hand_detector is not None:
+    hand_detector.close()
 cv2.destroyAllWindows()
