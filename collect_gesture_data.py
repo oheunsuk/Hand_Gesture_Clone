@@ -8,9 +8,33 @@ import cv2
 import mediapipe as mp
 
 from camera_util import open_webcam
-from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
+
+# MediaPipe solutions 패키지가 없는 환경에서도 동작하도록 손 연결선을 상수로 정의한다.
+HAND_CONNECTIONS = (
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (13, 17),
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+)
 
 CLASSES = ["palm", "thumb", "fist"]
 IMAGE_ROOT_DIR = Path("YOLO") / "data"
