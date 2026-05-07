@@ -1,0 +1,45 @@
+{
+  "timestamp": "2026-05-08 00:17:46",
+  "elapsed_seconds": 115.636,
+  "args": {
+    "data": "D:\\hand\\Hand_Gesture\\YOLO\\data.yaml",
+    "model": "yolov8n.pt",
+    "epochs": 40,
+    "imgsz": 416,
+    "batch": 8,
+    "project": "D:\\hand\\Hand_Gesture\\YOLO\\runs",
+    "name": "serbot_test",
+    "seed": 42,
+    "patience": 20,
+    "val_ratio": 0.2,
+    "min_samples_per_class": 2,
+    "device": "0",
+    "allow_cpu": false
+  },
+  "split_summary": {
+    "total_samples": 400,
+    "train_samples": 320,
+    "val_samples": 80,
+    "class_distribution": {
+      "fist": {
+        "train": 160,
+        "val": 40
+      },
+      "palm": {
+        "train": 160,
+        "val": 40
+      }
+    },
+    "overlap_count": 0,
+    "dataset_root": "D:\\hand\\Hand_Gesture\\YOLO\\datasets",
+    "train_images": "D:\\hand\\Hand_Gesture\\YOLO\\datasets\\train\\images",
+    "val_images": "D:\\hand\\Hand_Gesture\\YOLO\\datasets\\val\\images"
+  },
+  "val_metrics": {
+    "precision": 0.9982520875997068,
+    "recall": 1.0,
+    "f1": 0.9991252793323024,
+    "map50": 0.995,
+    "map50_95": 0.9300115680300278
+  }
+}
