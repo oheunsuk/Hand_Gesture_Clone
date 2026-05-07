@@ -13,13 +13,37 @@ import mediapipe as mp
 from camera_util import open_webcam
 import numpy as np
 import requests
-from mediapipe.python.solutions.hands_connections import HAND_CONNECTIONS
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python import vision
 
+# MediaPipe solutions 패키지가 없는 환경에서도 동작하도록 손 연결선을 상수로 정의한다.
+HAND_CONNECTIONS = (
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (13, 17),
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+)
+
 STATUS_ENDPOINT = "http://127.0.0.1:8000/status"
-SEND_INTERVAL_SEC = 0.2
-BACKEND_TIMEOUT_SEC = 0.25
+SEND_INTERVAL_SEC = 0.3
+BACKEND_TIMEOUT_SEC = 0.08
 SEQUENCE_LENGTH = 20
 SMOOTHING_LENGTH = 7
 ROTATION_COMMAND_HOLD_SEC = 0.7
@@ -28,10 +52,12 @@ SWIPE_WRIST_BUFFER_SIZE = 12
 MOTION_THRESHOLD = 0.10
 LINEARITY_THRESHOLD = 0.55
 SWIPE_COOLDOWN_SEC = 0.35
-CAM_WIDTH = 640
-CAM_HEIGHT = 480
+CAM_WIDTH = 480
+CAM_HEIGHT = 360
 SWIPE_SERIES_LENGTH = 30
-PROCESS_EVERY_N_FRAMES = 2
+PROCESS_EVERY_N_FRAMES = 3
+SHOW_LANDMARKS_DEFAULT = True
+SHOW_DEBUG_DEFAULT = False
 
 _http_session = requests.Session()
 
@@ -268,8 +294,8 @@ def main():
     # 테스트용 모드/명령 상태
     mode = "AUTO"
     command = "NONE"
-    show_landmarks = True  # 기본값: 랜드마크 ON (l 키로 토글 가능)
-    show_debug = True  # 기본값: 디버그 ON (d 키로 토글 가능)
+    show_landmarks = SHOW_LANDMARKS_DEFAULT  # l 키로 토글 가능
+    show_debug = SHOW_DEBUG_DEFAULT  # d 키로 토글 가능
     robot_status = "Moving"
     pending_payload = None
     last_sent_time = 0.0
@@ -284,14 +310,14 @@ def main():
                 continue
 
             frame = cv2.flip(frame, 1)  # 셀피 뷰
-            display_frame = frame.copy()
+            display_frame = frame
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int(time.monotonic() * 1000)
             frame_index += 1
             # 추론 부하를 줄이기 위해 N프레임마다 MediaPipe 추론을 수행한다.
             if last_result is None or frame_index % PROCESS_EVERY_N_FRAMES == 0:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                timestamp_ms = int(time.monotonic() * 1000)
                 result = detector.detect_for_video(mp_image, timestamp_ms)
                 last_result = result
             else:
